@@ -78,7 +78,7 @@ Firstly, the position limits on the individual underlyings are too little. Eithe
 
 ---
 <details>
-<summary><h2>Round 2: Options Trading</h2></summary>
+<summary><h2>Round 3: Options Trading</h2></summary>
 
 Round 3 introduced Volcanic Rocks and five Volcanic Rock Vouchers at strike prices 9,500, 9,750, 10,000, 10,250, and 10,500. The vouchers will give the holder the right but not obligation to buy a Volcanic Rock at the strike price at the expiry timestamp. At beginning of Round 1, all the Vouchers have 7 trading days to expire. By end of Round 5, vouchers will have 2 trading days left to expire.
 
