@@ -21,7 +21,7 @@ IMC_Prosperity_3_Documentation.pdf
 ---
 
 ## 🛠️ Rounds and Strategies
-<display>
+<details>
 <summary><h2>Round 1: Market Making</h2></summary>
 
 Round 1 introduced three products - Rainforest Resin, Kelp, and Squid Ink.
@@ -61,10 +61,10 @@ Squid Ink is much more volatile than the other two products mentioned above. Fro
 ![Squid Ink Order Book](readme_attachments/ink_book.png)
 
 To capture this mean-reversion behavior, we implemented a mean reversion trading strategy on a rolling window.
-</display>
+</details>
 
 ---
-<display>
+<details>
 <summary><h2>Round 2: Index Arbitrage</h2></summary>
 
 Round 2 introduced two picnic baskets. Picnic Basket 1 contains six Croissants, three Jams, and One Djembe, while Picnic Basket 2 contains four Croissants and two Jams. Additionally, participants can trade the underlying products individually.
@@ -74,10 +74,10 @@ The obvious strategy here is to trade on the deviation between the baskets' pric
 We initially tried pair trading strategies between the actual baskets and the synthetic baskets. However, some issues arose.
 
 Firstly, the position limits on the individual underlyings are too little. Either we reduce the positions on the baskets to fully hedge our positions, which causes unused capacity for the baskets, or we fully utilize the position limits on the baskets, which causes our positions to be partially unhedged. Moreover, in backtesting, we realized that our profit is mostly contributed by the baskets, and our positions in the underlyings are always losing. Therefore, we decided to use the spreads as a signal to long/ short the baskets, but not to trade the underlyings.
-</display>
+</details>
 
 ---
-<display>
+<details>
 <summary><h2>Round 2: Options Trading</h2></summary>
 
 Round 3 introduced Volcanic Rocks and five Volcanic Rock Vouchers at strike prices 9,500, 9,750, 10,000, 10,250, and 10,500. The vouchers will give the holder the right but not obligation to buy a Volcanic Rock at the strike price at the expiry timestamp. At beginning of Round 1, all the Vouchers have 7 trading days to expire. By end of Round 5, vouchers will have 2 trading days left to expire.
@@ -99,10 +99,10 @@ We use the fitted parameters below for our trading strategy:
   - \( a \) (quadratic term): 0.1850111314490967  
   - \( b \) (linear term): 0.0008529599232086579  
   - \( c \) (intercept): 0.14879176125529844
-</display>
+</details>
 
 ---
-<display>
+<details>
 <summary><h2>Round 4: Factor Trading</h2></summary>
 Round 4 introduced Magnificent Macarons along with a bunch of data on sunlight index, sugar prices, import and export tariffs, and transport fees. We are allowed to trade in both the domestic and the foreign market (Pristine Cuisine). To purchase 1 unit of Magnificent Macaron from Pristine Cuisine, we will purchase at the foreign ask price, pay transport fee and import tariff. To sell 1 unit of Magnificent Macaron to Pristine Cuisine, we will sell at the foreign bid price, pay transport fee and export tariff. For every 1 unit of Magnificent Macaron net long position, storage cost of 0.1 Seashells per timestamp will be applied for the duration that position is held. No storage cost applicable to net short position.
 
@@ -116,17 +116,17 @@ We identify the current trend of sunlight index and sugar price using the curren
 - **Sunlight downtrend + sugar uptrend**: Buy signal
 
 As all outstanding positions at the end of the day will be force-converted, this will potentially result in a huge loss if we do not unwind our positions earlier. Therefore, when the timestamp is greater than 999,000 (i.e., the last 10 timestamps of the day), the algorithm solely unwinds all positions either in the domestic or the foreign market, whichever is more favorable.
-</display>
+</details>
 
 ---
-<display>
+<details>
 <summary><h2>Round 5: Counterparty Information</h2></summary>
 
 The final round introduced no new products. Instead, we can now see the parties behind every trade in the market. We identified that Olivia was buying the dip and selling the tip in Squid Ink and Croissant. We implemented the strategy to follow Olivia's Squid Ink trades all-in if the signal is detected, and fall back to our original strategy otherwise. Effectively, we take the entire bid order book if a sell signal is detected, and take the entire ask order book if a buy signal is detected.
 
 ![Olivia Squid Ink Trades](readme_attachments/olivia_squid_ink.png)
 ![Olivia Croissant Trades](readme_attachments/olivia_croissants.png)
-</display>
+</details>
 
 ---
 
