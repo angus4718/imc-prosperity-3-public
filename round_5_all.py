@@ -1,5 +1,5 @@
 import math
-from abc import abstractmethod
+from abc import abstractmethod, ABC
 from collections import deque
 from copy import deepcopy
 from math import exp, log, sqrt
@@ -145,20 +145,235 @@ class Logger:
 logger = Logger()
 
 
+class MarketUtils:
+    """Holds utility functions used across strategies."""
 
-class Strategy:
+    def safe_best_bid(self, order_depth) -> Optional[int]:
+        if not order_depth or not order_depth.buy_orders:
+            return None
+        return max(order_depth.buy_orders.keys())
+
+    def safe_best_ask(self, order_depth) -> Optional[int]:
+        if not order_depth or not order_depth.sell_orders:
+            return None
+        return min(order_depth.sell_orders.keys())
+
+    def has_liquidity(self, order_depth) -> bool:
+        return bool(order_depth and order_depth.buy_orders and order_depth.sell_orders)
+
+    def rolling_mean_std(self, values: List[float], period: int) -> Tuple[float, float]:
+        window = values[-period:]
+        n = len(window)
+        if n == 0:
+            return 0.0, 0.0
+        m = sum(window) / n
+        var = sum((x - m) ** 2 for x in window) / n
+        return m, math.sqrt(var)
+
+
+class InteractionBlocks:
+    """Wraps strategy helper functions: mean reversion, taking, making, zero-EV."""
+
+    def __init__(self, utils: MarketUtils):
+        self.u = utils
+
+    def mean_reversion_taker(
+        self,
+        state,  # TradingState
+        parent,  # Strategy
+        symbol: str,
+        limit: int,
+        price_array: List[float],
+        fair_price: float,
+        period: int,
+        z_score_threshold: float,
+        fixed_threshold: float,
+    ) -> None:
+        position = state.position.get(symbol, 0)
+        order_depth = parent.order_depth_internal
+
+        if len(price_array) < period:
+            return
+
+        rolling_mean = sum(price_array[-period:]) / period
+        rolling_std = (sum((x - rolling_mean) ** 2 for x in price_array[-period:]) / period) ** 0.5
+
+        if rolling_std == 0:
+            return
+
+        deviation = fair_price - rolling_mean
+        z_score = deviation / rolling_std
+
+        if z_score < -z_score_threshold and deviation < -fixed_threshold and order_depth.sell_orders:
+            best_ask = min(order_depth.sell_orders.keys())
+            amount_to_buy = min(
+                -order_depth.sell_orders[best_ask],
+                limit - position - parent.total_buying_amount,
+            )
+            if amount_to_buy > 0 and best_ask > 0:
+                parent.buy(best_ask, amount_to_buy)
+                parent.total_buying_amount += amount_to_buy
+
+        elif z_score > z_score_threshold and deviation > fixed_threshold and order_depth.buy_orders:
+            best_bid = max(order_depth.buy_orders.keys())
+            amount_to_sell = min(
+                order_depth.buy_orders[best_bid],
+                limit + position - parent.total_selling_amount,
+            )
+            if amount_to_sell > 0 and best_bid > 0:
+                parent.sell(best_bid, amount_to_sell)
+                parent.total_selling_amount += amount_to_sell
+
+    def market_taking_strategy(
+        self,
+        state,  # TradingState
+        parent,  # Strategy
+        symbol: str,
+        limit: int,
+        fair_buying_price: float,
+        fair_selling_price: float,
+        max_size: int,
+    ) -> Tuple[int, int]:
+        position = state.position.get(symbol, 0)
+        order_depth = parent.order_depth_internal
+        sizes = [0, 0]
+
+        # Market taking: selling orders
+        max_buy_amount = max_size
+        if order_depth.sell_orders:
+            asks = sorted(order_depth.sell_orders.keys())
+            for best_buying_price in asks:
+                if best_buying_price <= fair_buying_price:
+                    best_buying_amount = -order_depth.sell_orders[best_buying_price]
+                    amount_to_buy = min(
+                        best_buying_amount, limit - position - parent.total_buying_amount, max_buy_amount
+                    )
+                    if amount_to_buy > 0:
+                        parent.buy(best_buying_price, amount_to_buy)
+                        sizes[0] += amount_to_buy
+                        max_buy_amount -= amount_to_buy
+
+        # Market taking: buying orders
+        max_sell_amount = max_size
+        if order_depth.buy_orders:
+            bids = sorted(order_depth.buy_orders.keys(), reverse=True)
+            for best_selling_price in bids:
+                if best_selling_price >= fair_selling_price:
+                    best_selling_amount = order_depth.buy_orders[best_selling_price]
+                    amount_to_sell = min(
+                        best_selling_amount, limit + position - parent.total_selling_amount, max_sell_amount
+                    )
+                    if amount_to_sell > 0:
+                        parent.sell(best_selling_price, amount_to_sell)
+                        sizes[1] += amount_to_sell
+                        max_sell_amount -= amount_to_sell
+
+        return sizes[0], sizes[1]
+
+    def market_making_strategy(
+        self,
+        state,  # TradingState
+        parent,  # Strategy
+        symbol: str,
+        limit: int,
+        zero_ev_bid: float,
+        zero_ev_ask: float,
+        pos_ev_bid: float,
+        pos_ev_ask: float,
+        max_bid_size: int,
+        max_ask_size: int,
+    ) -> None:
+        position = state.position.get(symbol, 0)
+        order_depth = parent.order_depth_internal
+
+        # Market making: buy orders
+        remaining_buy_capacity = min(limit - position - parent.total_buying_amount, max_bid_size)
+        if remaining_buy_capacity > 0:
+            max_buy_price = (
+                max(
+                    [price for price in order_depth.buy_orders.keys() if price < zero_ev_bid],
+                    default=pos_ev_bid,
+                )
+                + 1
+            )
+            buy_price = min(max_buy_price, pos_ev_bid)
+            parent.buy(buy_price, remaining_buy_capacity)
+
+        # Market making: sell orders
+        remaining_sell_capacity = min(limit + position - parent.total_selling_amount, max_ask_size)
+        if remaining_sell_capacity > 0:
+            min_sell_price = (
+                min(
+                    [price for price in order_depth.sell_orders.keys() if price > zero_ev_ask],
+                    default=pos_ev_ask,
+                )
+                - 1
+            )
+            sell_price = max(min_sell_price, pos_ev_ask)
+            parent.sell(sell_price, remaining_sell_capacity)
+
+    def zero_ev_trades(
+        self,
+        state,  # TradingState
+        parent,  # Strategy
+        symbol: str,
+        limit: int,
+        fair_buying_price: float,
+        fair_selling_price: float,
+    ) -> None:
+        position = state.position.get(symbol, 0)
+        order_depth = parent.order_depth_internal
+
+        # Zero EV sell trades
+        if position > 0 and fair_selling_price in order_depth.buy_orders:
+            amount_to_sell = min(
+                position,
+                order_depth.buy_orders[fair_selling_price],
+                limit + position - parent.total_selling_amount,
+            )
+            if amount_to_sell > 0:
+                parent.sell(fair_selling_price, amount_to_sell)
+
+        # Zero EV buy trades
+        elif position < 0 and fair_buying_price in order_depth.sell_orders:
+            amount_to_buy = min(
+                -position,
+                -order_depth.sell_orders[fair_buying_price],
+                limit - position - parent.total_buying_amount,
+            )
+            if amount_to_buy > 0:
+                parent.buy(fair_buying_price, amount_to_buy)
+
+
+class SignalSnoopers:
+
+    def get_olivia_signal(self, product, state) -> int:
+        buy_bots = [t.buyer for t in state.own_trades.get(product, []) + state.market_trades.get(product, [])]
+        sell_bots = [t.seller for t in state.own_trades.get(product, []) + state.market_trades.get(product, [])]
+        if "Olivia" in buy_bots:
+            return 1
+        if "Olivia" in sell_bots:
+            return -1
+        return 0
+
+
+class Strategy(ABC):
+    """Base class unchanged in logic; provides order handling and internal book simulation."""
+
     def __init__(self, symbol: str, limit: int) -> None:
         self.symbol = symbol
         self.limit = limit
         self.total_buying_amount = 0
         self.total_selling_amount = 0
         self.order_depth_internal = None
+        self.orders = []
+        self.conversions = 0
 
     @abstractmethod
-    def act(self, state: TradingState) -> None:
+    def act(self, state) -> None:
         raise NotImplementedError()
 
-    def run(self, state: TradingState) -> tuple[list[Order], int]:
+    def run(self, state) -> Tuple[List, int]:
         self.total_buying_amount = 0
         self.total_selling_amount = 0
         self.orders = []
@@ -170,7 +385,7 @@ class Strategy:
 
         return self.orders, self.conversions
 
-    def popular_price_calculator(self, order_depth: OrderDepth) -> float:
+    def popular_price_calculator(self, order_depth) -> float:
         buy_orders = order_depth.buy_orders
         sell_orders = order_depth.sell_orders
 
@@ -189,7 +404,7 @@ class Strategy:
         popular_price = (popular_buying_price + popular_selling_price) / 2
 
         return popular_price
-    
+
     def buy(self, price: int, quantity: int) -> None:
         assert isinstance(price, int)
         assert isinstance(quantity, int)
@@ -244,193 +459,52 @@ class Strategy:
         pass
 
 
-def mean_reversion_taker(
-    state: TradingState,
-    parent: Strategy,
-    symbol: str,
-    limit: int,
-    price_array: list[float],
-    fair_price: float,
-    period: int,
-    z_score_threshold: float,
-    fixed_threshold: float,
-) -> None:
+class BlackScholes:
 
-    position = state.position.get(symbol, 0)
-    order_depth = parent.order_depth_internal
-
-    if len(price_array) < period:
-        return
-
-    rolling_mean = sum(price_array[-period:]) / period
-    rolling_std = (sum((x - rolling_mean) ** 2 for x in price_array[-period:]) / period) ** 0.5
-
-    if rolling_std == 0:
-        return
-
-    deviation = fair_price - rolling_mean
-    z_score = deviation / rolling_std
-    
-    if z_score < -z_score_threshold and deviation < -fixed_threshold and order_depth.sell_orders:
-        best_ask = min(order_depth.sell_orders.keys())
-        amount_to_buy = min(
-            -order_depth.sell_orders[best_ask],
-            limit - position - parent.total_buying_amount,
+    def black_scholes_call(self, spot, strike, time_to_expiry, volatility):
+        d1 = (log(spot) - log(strike) + (0.5 * volatility * volatility) * time_to_expiry) / (
+            volatility * sqrt(time_to_expiry)
         )
-        if amount_to_buy > 0 and best_ask > 0:
-            parent.buy(best_ask, amount_to_buy)
-            parent.total_buying_amount += amount_to_buy
+        d2 = d1 - volatility * sqrt(time_to_expiry)
+        call_price = spot * NormalDist().cdf(d1) - strike * NormalDist().cdf(d2)
+        return call_price
 
-    elif z_score > z_score_threshold and deviation > fixed_threshold and order_depth.buy_orders:
-        best_bid = max(order_depth.buy_orders.keys())
-        amount_to_sell = min(
-            order_depth.buy_orders[best_bid],
-            limit + position - parent.total_selling_amount,
+    def delta(self, spot, strike, time_to_expiry, volatility):
+        d1 = (log(spot) - log(strike) + (0.5 * volatility * volatility) * time_to_expiry) / (
+            volatility * sqrt(time_to_expiry)
         )
-        if amount_to_sell > 0 and best_bid > 0:
-            parent.sell(best_bid, amount_to_sell)
-            parent.total_selling_amount += amount_to_sell
+        return NormalDist().cdf(d1)
 
-
-def market_taking_strategy(
-    state: TradingState,
-    parent: Strategy,
-    symbol: str,
-    limit: int,
-    fair_buying_price: float,
-    fair_selling_price: float,
-    max_size: int,
-) -> None:
-    position = state.position.get(symbol, 0)
-    order_depth = parent.order_depth_internal
-    sizes = [0, 0]
-
-    # Market taking: selling orders
-    max_buy_amount = max_size
-    if order_depth.sell_orders:
-        asks = sorted(order_depth.sell_orders.keys())
-        for best_buying_price in asks:
-            if best_buying_price <= fair_buying_price:
-                best_buying_amount = -order_depth.sell_orders[best_buying_price]
-                amount_to_buy = min(best_buying_amount, limit - position - parent.total_buying_amount, max_buy_amount)
-                if amount_to_buy > 0:
-                    parent.buy(best_buying_price, amount_to_buy)
-                    sizes[0] += amount_to_buy
-                    max_buy_amount -= amount_to_buy
-
-    # Market taking: buying orders
-    max_sell_amount = max_size
-    if order_depth.buy_orders:
-        bids = sorted(order_depth.buy_orders.keys(), reverse=True)
-        for best_selling_price in bids:
-            if best_selling_price >= fair_selling_price:
-                best_selling_amount = order_depth.buy_orders[best_selling_price]
-                amount_to_sell = min(
-                    best_selling_amount, limit + position - parent.total_selling_amount, max_sell_amount
-                )
-                if amount_to_sell > 0:
-                    parent.sell(best_selling_price, amount_to_sell)
-                    sizes[1] += amount_to_sell
-                    max_sell_amount -= amount_to_sell
-
-    return sizes
-
-
-def market_making_strategy(
-    state: TradingState,
-    parent: Strategy,
-    symbol: str,
-    limit: int,
-    zero_ev_bid: float,
-    zero_ev_ask: float,
-    pos_ev_bid: float,
-    pos_ev_ask: float,
-    max_bid_size: int,
-    max_ask_size: int,
-) -> None:
-    position = state.position.get(symbol, 0)
-    order_depth = parent.order_depth_internal
-
-    # Market making: buy orders
-    remaining_buy_capacity = min(limit - position - parent.total_buying_amount, max_bid_size)
-    if remaining_buy_capacity > 0:
-        max_buy_price = (
-            max(
-                [price for price in order_depth.buy_orders.keys() if price < zero_ev_bid],
-                default=pos_ev_bid,
-            )
-            + 1
-        )
-        buy_price = min(max_buy_price, pos_ev_bid)
-        parent.buy(buy_price, remaining_buy_capacity)
-
-    # Market making: sell orders
-    remaining_sell_capacity = min(limit + position - parent.total_selling_amount, max_ask_size)
-    if remaining_sell_capacity > 0:
-        min_sell_price = (
-            min(
-                [price for price in order_depth.sell_orders.keys() if price > zero_ev_ask],
-                default=pos_ev_ask,
-            )
-            - 1
-        )
-        sell_price = max(min_sell_price, pos_ev_ask)
-        parent.sell(sell_price, remaining_sell_capacity)
-
-
-def zero_ev_trades(
-    state: TradingState, parent: Strategy, symbol: str, limit: int, fair_buying_price: float, fair_selling_price: float
-) -> None:
-    position = state.position.get(symbol, 0)
-    order_depth = parent.order_depth_internal
-
-    # Zero EV sell trades
-    if position > 0 and fair_selling_price in order_depth.buy_orders:
-        amount_to_sell = min(
-            position,
-            order_depth.buy_orders[fair_selling_price],
-            limit + position - parent.total_selling_amount,
-        )
-        if amount_to_sell > 0:
-            parent.sell(fair_selling_price, amount_to_sell)
-
-    # Zero EV buy trades
-    elif position < 0 and fair_buying_price in order_depth.sell_orders:
-        amount_to_buy = min(
-            -position,
-            -order_depth.sell_orders[fair_buying_price],
-            limit - position - parent.total_buying_amount,
-        )
-        if amount_to_buy > 0:
-            parent.buy(fair_buying_price, amount_to_buy)
-
-
-def get_olivia_signal(product, state: TradingState):
-    buy_bots = [t.buyer for t in state.own_trades.get(product, []) + state.market_trades.get(product, [])]
-    sell_bots = [t.seller for t in state.own_trades.get(product, []) + state.market_trades.get(product, [])]
-    if "Olivia" in buy_bots:
-        return 1
-    if "Olivia" in sell_bots:
-        return -1
-    return 0
+    def implied_volatility(self, call_price, spot, strike, time_to_expiry, max_iterations=200, tolerance=1e-10):
+        low_vol = 0.01
+        high_vol = 1.0
+        volatility = (low_vol + high_vol) / 2.0  # Initial guess as the midpoint
+        for _ in range(max_iterations):
+            estimated_price = BlackScholes.black_scholes_call(spot, strike, time_to_expiry, volatility)
+            diff = estimated_price - call_price
+            if abs(diff) < tolerance:
+                break
+            elif diff > 0:
+                high_vol = volatility
+            else:
+                low_vol = volatility
+            volatility = (low_vol + high_vol) / 2.0
+        return volatility
 
 
 class KelpStrategy(Strategy):
-    def __init__(
-        self,
-        symbol: str,
-        limit: int,
-        deflection_threshold: float,
-    ) -> None:
+    def __init__(self, symbol: str, limit: int, deflection_threshold: float, utils: MarketUtils, blocks: InteractionBlocks):
         super().__init__(symbol, limit)
         self.symbol = symbol
         self.limit = limit
         self.deflection_threshold = deflection_threshold
-
         self.price_array = []
         self.price_array_max_length = 10
+        self.fair_price = 0.0
+        self.u = utils
+        self.b = blocks
 
-    def act(self, state: TradingState) -> None:
+    def act(self, state) -> None:
         order_depth = state.order_depths.get(self.symbol, None)
         if not order_depth:
             return
@@ -452,9 +526,9 @@ class KelpStrategy(Strategy):
                 # Add 100 to pos_ev_ask so that the algo only buys
                 pos_ev_ask += 100
 
-        zero_ev_trades(state, self, self.symbol, self.limit, zero_ev_bid, zero_ev_ask)
-        market_taking_strategy(state, self, self.symbol, self.limit, pos_ev_bid, pos_ev_ask, self.limit)
-        market_making_strategy(
+        self.b.zero_ev_trades(state, self, self.symbol, self.limit, zero_ev_bid, zero_ev_ask)
+        self.b.market_taking_strategy(state, self, self.symbol, self.limit, pos_ev_bid, pos_ev_ask, self.limit)
+        self.b.market_making_strategy(
             state,
             self,
             self.symbol,
@@ -478,19 +552,19 @@ class KelpStrategy(Strategy):
 
 
 class SquidInkStrategy(Strategy):
-    def __init__(
-        self,
-        symbol: str,
-        limit: int,
-    ) -> None:
+    def __init__(self, symbol: str, limit: int, utils: MarketUtils, blocks: InteractionBlocks, snoop: SignalSnoopers):
         super().__init__(symbol, limit)
         self.symbol = symbol
         self.limit = limit
 
         self.price_array = []
         self.price_array_max_length = 100
+        self.fair_price = 0.0
+        self.u = utils
+        self.b = blocks
+        self.s = snoop
 
-    def act(self, state: TradingState) -> None:
+    def act(self, state) -> None:
         order_depth = state.order_depths.get(self.symbol, None)
         if not order_depth:
             return
@@ -498,15 +572,15 @@ class SquidInkStrategy(Strategy):
             return
 
         self.fair_price = self.popular_price_calculator(order_depth)
-        olivia_signal = get_olivia_signal(self.symbol, state)
+        olivia_signal = self.s.get_olivia_signal(self.symbol, state)
         if olivia_signal == 1:
-            market_taking_strategy(state, self, self.symbol, self.limit, 99999, 99999, self.limit)
+            self.b.market_taking_strategy(state, self, self.symbol, self.limit, 99999, 99999, self.limit)
             return
         elif olivia_signal == -1:
-            market_taking_strategy(state, self, self.symbol, self.limit, 1, 1, self.limit)
+            self.b.market_taking_strategy(state, self, self.symbol, self.limit, 1, 1, self.limit)
             return
 
-        mean_reversion_taker(state, self, self.symbol, self.limit, self.price_array, self.fair_price, 100, 0, 30)
+        self.b.mean_reversion_taker(state, self, self.symbol, self.limit, self.price_array, self.fair_price, 100, 0, 30)
 
     def save(self) -> JSON:
         self.price_array.append(self.fair_price)
@@ -519,55 +593,49 @@ class SquidInkStrategy(Strategy):
 
 
 class CroissantStrategy(Strategy):
-    def __init__(
-        self,
-        symbol: str,
-        limit: int,
-    ) -> None:
+    def __init__(self, symbol: str, limit: int, snoop: SignalSnoopers, blocks: InteractionBlocks):
         super().__init__(symbol, limit)
         self.symbol = symbol
         self.limit = limit
+        self.s = snoop
+        self.b = blocks
 
-    def act(self, state: TradingState) -> None:
+    def act(self, state) -> None:
         order_depth = state.order_depths.get(self.symbol, None)
         if not order_depth:
             return
         if len(order_depth.buy_orders) == 0 or len(order_depth.sell_orders) == 0:
             return
 
-        olivia_signal = get_olivia_signal(self.symbol, state)
+        olivia_signal = self.s.get_olivia_signal(self.symbol, state)
         if olivia_signal == 1:
-            market_taking_strategy(state, self, self.symbol, self.limit, 99999, 99999, self.limit)
+            self.b.market_taking_strategy(state, self, self.symbol, self.limit, 99999, 99999, self.limit)
             return
         elif olivia_signal == -1:
-            market_taking_strategy(state, self, self.symbol, self.limit, 1, 1, self.limit)
+            self.b.market_taking_strategy(state, self, self.symbol, self.limit, 1, 1, self.limit)
             return
 
+
 class RainforestResinStrategy(Strategy):
-    def __init__(
-        self,
-        symbol: str,
-        limit: int,
-    ) -> None:
+    def __init__(self, symbol: str, limit: int, blocks: InteractionBlocks):
         super().__init__(symbol, limit)
         self.symbol = symbol
         self.limit = limit
-
-        # Sub-strategies
         self.market_taking = None
         self.zero_ev = None
         self.market_making = None
+        self.b = blocks
 
-    def act(self, state: TradingState) -> None:
+    def act(self, state) -> None:
         order_depth = state.order_depths.get(self.symbol, None)
         if not order_depth:
             return
 
         zero_ev_bid, zero_ev_ask = 10000, 10000
         pos_ev_bid, pos_ev_ask = 9999, 10001
-        market_taking_strategy(state, self, self.symbol, self.limit, pos_ev_bid, pos_ev_ask, self.limit)
-        zero_ev_trades(state, self, self.symbol, self.limit, zero_ev_bid, zero_ev_ask)
-        market_making_strategy(
+        self.b.market_taking_strategy(state, self, self.symbol, self.limit, pos_ev_bid, pos_ev_ask, self.limit)
+        self.b.zero_ev_trades(state, self, self.symbol, self.limit, zero_ev_bid, zero_ev_ask)
+        self.b.market_making_strategy(
             state,
             self,
             self.symbol,
@@ -591,6 +659,8 @@ class PicnicBasketStrategy(Strategy):
         aggressive_deflection_adj: int,
         normal_deflection_adj: int,
         default_size: int,
+        utils: MarketUtils,
+        blocks: InteractionBlocks,
     ) -> None:
         super().__init__(symbol, limit)
         self.symbol = symbol
@@ -600,8 +670,10 @@ class PicnicBasketStrategy(Strategy):
         self.aggressive_deflection_adj = aggressive_deflection_adj
         self.normal_deflection_adj = normal_deflection_adj
         self.default_size = default_size
+        self.u = utils
+        self.b = blocks
 
-    def act(self, state: TradingState) -> None:
+    def act(self, state) -> None:
         if any(
             symbol not in state.order_depths
             for symbol in ["CROISSANTS", "JAMS", "DJEMBES", "PICNIC_BASKET1", "PICNIC_BASKET2"]
@@ -630,15 +702,13 @@ class PicnicBasketStrategy(Strategy):
 
         self.fair_price = {"PICNIC_BASKET1": picnic_basket1_mid, "PICNIC_BASKET2": picnic_basket2_mid}[self.symbol]
         zero_ev_bid, zero_ev_ask = math.floor(self.fair_price), math.ceil(self.fair_price)
-        pos_ev_bid = zero_ev_bid if zero_ev_bid < self.fair_price else zero_ev_bid - 1
-        pos_ev_ask = zero_ev_ask if zero_ev_ask > self.fair_price else zero_ev_ask + 1
 
         if amount_to_buy > 0:
             if amount_to_buy > self.position_threshold:
                 bid = zero_ev_bid + self.aggressive_adj
                 ask = zero_ev_ask + self.aggressive_deflection_adj
-                sent_sizes = market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_buy)
-                market_making_strategy(
+                sent_sizes = self.b.market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_buy)
+                self.b.market_making_strategy(
                     state,
                     self,
                     self.symbol,
@@ -653,8 +723,8 @@ class PicnicBasketStrategy(Strategy):
             else:
                 bid = zero_ev_bid
                 ask = zero_ev_ask + self.normal_deflection_adj
-                sent_sizes = market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_buy)
-                market_making_strategy(
+                sent_sizes = self.b.market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_buy)
+                self.b.market_making_strategy(
                     state,
                     self,
                     self.symbol,
@@ -671,8 +741,8 @@ class PicnicBasketStrategy(Strategy):
             if amount_to_sell > self.position_threshold:
                 bid = zero_ev_bid - self.aggressive_deflection_adj
                 ask = zero_ev_ask - self.aggressive_adj
-                sent_sizes = market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_sell)
-                market_making_strategy(
+                sent_sizes = self.b.market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_sell)
+                self.b.market_making_strategy(
                     state,
                     self,
                     self.symbol,
@@ -687,8 +757,8 @@ class PicnicBasketStrategy(Strategy):
             else:
                 bid = zero_ev_bid - self.normal_deflection_adj
                 ask = zero_ev_ask
-                sent_sizes = market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_sell)
-                market_making_strategy(
+                sent_sizes = self.b.market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, amount_to_sell)
+                self.b.market_making_strategy(
                     state,
                     self,
                     self.symbol,
@@ -703,8 +773,8 @@ class PicnicBasketStrategy(Strategy):
 
         else:
             bid, ask = zero_ev_bid, zero_ev_ask
-            sent_sizes = market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, self.default_size)
-            market_making_strategy(
+            sent_sizes = self.b.market_taking_strategy(state, self, self.symbol, self.limit, bid, ask, self.default_size)
+            self.b.market_making_strategy(
                 state,
                 self,
                 self.symbol,
@@ -719,7 +789,7 @@ class PicnicBasketStrategy(Strategy):
 
         logger.print(self.symbol, spread_1, spread_2, desired_position, position, amount_to_buy, amount_to_sell)
 
-    def get_mid(self, order_depth: OrderDepth, method: str) -> float:
+    def get_mid(self, order_depth, method: str) -> float:
         bid_prices, ask_prices, bid_volumes, ask_volumes = [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]
         for i, (price, volume) in enumerate(sorted(order_depth.buy_orders.items(), reverse=True)[:3]):
             bid_prices[i] = price
@@ -763,38 +833,6 @@ class PicnicBasketStrategy(Strategy):
             return 0
 
 
-class BlackScholes:
-    def black_scholes_call(self, spot, strike, time_to_expiry, volatility):
-        d1 = (log(spot) - log(strike) + (0.5 * volatility * volatility) * time_to_expiry) / (
-            volatility * sqrt(time_to_expiry)
-        )
-        d2 = d1 - volatility * sqrt(time_to_expiry)
-        call_price = spot * NormalDist().cdf(d1) - strike * NormalDist().cdf(d2)
-        return call_price
-
-    def delta(self, spot, strike, time_to_expiry, volatility):
-        d1 = (log(spot) - log(strike) + (0.5 * volatility * volatility) * time_to_expiry) / (
-            volatility * sqrt(time_to_expiry)
-        )
-        return NormalDist().cdf(d1)
-
-    def implied_volatility(self, call_price, spot, strike, time_to_expiry, max_iterations=200, tolerance=1e-10):
-        low_vol = 0.01
-        high_vol = 1.0
-        volatility = (low_vol + high_vol) / 2.0  # Initial guess as the midpoint
-        for _ in range(max_iterations):
-            estimated_price = BlackScholes.black_scholes_call(spot, strike, time_to_expiry, volatility)
-            diff = estimated_price - call_price
-            if abs(diff) < tolerance:
-                break
-            elif diff > 0:
-                high_vol = volatility
-            else:
-                low_vol = volatility
-            volatility = (low_vol + high_vol) / 2.0
-        return volatility
-
-
 class OptionStrategy(Strategy):
     def __init__(
         self,
@@ -803,6 +841,8 @@ class OptionStrategy(Strategy):
         window: int,
         z_score_threshold: float,
         strike: int,
+        utils: MarketUtils,
+        blocks: InteractionBlocks,
     ) -> None:
         super().__init__(symbol, limit)
         self.symbol = symbol
@@ -827,7 +867,10 @@ class OptionStrategy(Strategy):
         self.ask_params = {"a": 0.2878490683651303, "b": -0.0009201058370376721, "c": 0.1499510693474374}
         self.bid_params = {"a": 0.1850111314490967, "b": 0.0008529599232086579, "c": 0.14879176125529844}
 
-    def act(self, state: TradingState) -> None:
+        self.u = utils
+        self.b = blocks
+
+    def act(self, state) -> None:
         self.underlying_current_orders = 0
         order_depth = state.order_depths.get(self.symbol, None)
         if not order_depth:
@@ -862,7 +905,6 @@ class OptionStrategy(Strategy):
             theoretical_iv_bid = self.bid_params["c"] + self.bid_params["b"] * moneyness + self.bid_params["a"] * moneyness**2
             theoretical_bid_price = self.options_model.black_scholes_call(underlying_price, self.strike, tte, theoretical_iv_bid)
 
-        
         # Update price array
         if not order_depth.sell_orders:
             mid_price = best_bid + 1
@@ -879,9 +921,11 @@ class OptionStrategy(Strategy):
         self.price_array.append(mid_price)
         if len(self.price_array) < self.window:
             return
-        
+
         self.price_array = self.price_array[-self.window:]
-        mean_reversion_taker(state, self, self.symbol, self.limit, self.price_array, theoretical_mid_price, self.window, self.z_score_threshold, 1)
+        self.b.mean_reversion_taker(
+            state, self, self.symbol, self.limit, self.price_array, theoretical_mid_price, self.window, self.z_score_threshold, 1
+        )
 
         current_position = state.position.get(self.symbol, 0) + self.total_buying_amount - self.total_selling_amount
         delta = self.options_model.delta(underlying_price, self.strike, tte, theoretical_iv_mid)
@@ -905,7 +949,7 @@ class OptionStrategy(Strategy):
         self.underlying_current_orders += quantity
 
         remaining_quantity = quantity
-        
+
         while (
             price >= min(underlying_order_depth.sell_orders.keys(), default=float("inf")) and remaining_quantity > 0
         ):
@@ -940,8 +984,9 @@ class OptionStrategy(Strategy):
                 underlying_order_depth.buy_orders.pop(bid_price)
                 remaining_quantity -= bid_size
 
+
 class MacaronsStrategy(Strategy):
-    def __init__(self, symbol: str, limit: int, conversion_limit: int,sunlight_threshold: float, z_score_threshold: float) -> None:
+    def __init__(self, symbol: str, limit: int, conversion_limit: int, sunlight_threshold: float, z_score_threshold: float) -> None:
         super().__init__(symbol, limit)
         self.symbol = symbol
         self.limit = limit
@@ -954,7 +999,7 @@ class MacaronsStrategy(Strategy):
         self.current_trend_sunlight = None
         self.current_trend_sugar = None
 
-    def act(self, state: TradingState) -> None:
+    def act(self, state) -> None:
         position = state.position.get(self.symbol, 0)
 
         # Get observations
@@ -1069,7 +1114,12 @@ class MacaronsStrategy(Strategy):
 
 
 class Trader:
+
     def __init__(self):
+        self.utils = MarketUtils()
+        self.blocks = InteractionBlocks(self.utils)
+        self.snoop = SignalSnoopers()
+
         self.limit = {
             "RAINFOREST_RESIN": 50,
             "KELP": 50,
@@ -1090,16 +1140,21 @@ class Trader:
 
         self.strategies = {
             "RAINFOREST_RESIN": RainforestResinStrategy(
-                symbol="RAINFOREST_RESIN", limit=self.limit["RAINFOREST_RESIN"]
+                symbol="RAINFOREST_RESIN", limit=self.limit["RAINFOREST_RESIN"], blocks=self.blocks
             ),
-            "KELP": KelpStrategy(symbol="KELP", limit=self.limit["KELP"], deflection_threshold=0.5),
+            "KELP": KelpStrategy(symbol="KELP", limit=self.limit["KELP"], deflection_threshold=0.5, utils=self.utils, blocks=self.blocks),
             "SQUID_INK": SquidInkStrategy(
                 symbol="SQUID_INK",
                 limit=self.limit["SQUID_INK"],
+                utils=self.utils,
+                blocks=self.blocks,
+                snoop=self.snoop,
             ),
             "CROISSANTS": CroissantStrategy(
                 symbol="CROISSANTS",
                 limit=self.limit["CROISSANTS"],
+                snoop=self.snoop,
+                blocks=self.blocks,
             ),
             "PICNIC_BASKET1": PicnicBasketStrategy(
                 symbol="PICNIC_BASKET1",
@@ -1109,6 +1164,8 @@ class Trader:
                 aggressive_deflection_adj=100,
                 normal_deflection_adj=100,
                 default_size=3,
+                utils=self.utils,
+                blocks=self.blocks,
             ),
             "PICNIC_BASKET2": PicnicBasketStrategy(
                 symbol="PICNIC_BASKET2",
@@ -1118,6 +1175,8 @@ class Trader:
                 aggressive_deflection_adj=100,
                 normal_deflection_adj=100,
                 default_size=5,
+                utils=self.utils,
+                blocks=self.blocks,
             ),
             "VOLCANIC_ROCK_VOUCHER_9500": OptionStrategy(
                 symbol="VOLCANIC_ROCK_VOUCHER_9500",
@@ -1125,6 +1184,8 @@ class Trader:
                 window=100,
                 z_score_threshold=2,
                 strike=9500,
+                utils=self.utils,
+                blocks=self.blocks,
             ),
             "VOLCANIC_ROCK_VOUCHER_9750": OptionStrategy(
                 symbol="VOLCANIC_ROCK_VOUCHER_9750",
@@ -1132,6 +1193,8 @@ class Trader:
                 window=100,
                 z_score_threshold=2,
                 strike=9750,
+                utils=self.utils,
+                blocks=self.blocks,
             ),
             "VOLCANIC_ROCK_VOUCHER_10000": OptionStrategy(
                 symbol="VOLCANIC_ROCK_VOUCHER_10000",
@@ -1139,6 +1202,8 @@ class Trader:
                 window=100,
                 z_score_threshold=2,
                 strike=10000,
+                utils=self.utils,
+                blocks=self.blocks,
             ),
             "VOLCANIC_ROCK_VOUCHER_10250": OptionStrategy(
                 symbol="VOLCANIC_ROCK_VOUCHER_10250",
@@ -1146,6 +1211,8 @@ class Trader:
                 window=100,
                 z_score_threshold=2,
                 strike=10250,
+                utils=self.utils,
+                blocks=self.blocks,
             ),
             "VOLCANIC_ROCK_VOUCHER_10500": OptionStrategy(
                 symbol="VOLCANIC_ROCK_VOUCHER_10500",
@@ -1153,11 +1220,13 @@ class Trader:
                 window=100,
                 z_score_threshold=2,
                 strike=10500,
+                utils=self.utils,
+                blocks=self.blocks,
             ),
             "MAGNIFICENT_MACARONS": MacaronsStrategy("MAGNIFICENT_MACARONS", self.limit["MAGNIFICENT_MACARONS"], conversion_limit=10, sunlight_threshold=50, z_score_threshold=3),
         }
 
-    def run(self, state: TradingState) -> tuple[dict[str, list[Order]], int, str]:
+    def run(self, state) -> Tuple[Dict[str, List], int, str]:
         logger.print(state.position)
 
         conversions = 0
@@ -1174,9 +1243,11 @@ class Trader:
                 strategy_orders, strategy_conversions = strategy.run(state)
                 orders[symbol] = strategy_orders
                 conversions += strategy_conversions
+            else:
+                orders[symbol] = []
 
             new_trader_data[symbol] = strategy.save()
-        
+
         trader_data = jsonpickle.encode(new_trader_data)
 
         logger.flush(state, orders, conversions, trader_data)
